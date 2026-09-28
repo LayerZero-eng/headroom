@@ -740,3 +740,64 @@ class TestOutputFormatting:
 
         # Should have omission summary
         assert "lines omitted" in result.compressed
+
+
+def _pytest_log_with_failures(n_failed: int) -> str:
+    lines = [
+        "============================= test session starts =============================",
+        "collected 400 items",
+        "",
+    ]
+    for i in range(40):
+        lines.append(
+            f"tests/test_module_{i:02d}.py ...................................  [ {i * 2:2d}%]"
+        )
+    lines.append("=================================== FAILURES ==================================")
+    for i in range(1, n_failed + 1):
+        lines += [
+            f"____________________ test_case{i:02d} ____________________",
+            "",
+            ">       assert result == expected",
+            "E       AssertionError: mismatch",
+            "",
+            "tests/t.py:42: AssertionError",
+        ]
+    lines.append("=========================== short test summary info ===========================")
+    lines += [
+        f"FAILED tests/t.py::test_case{i:02d} - AssertionError: mismatch"
+        for i in range(1, n_failed + 1)
+    ]
+    lines.append(f"=============== {n_failed} failed, 380 passed in 41.02s ==============")
+    return "\n".join(lines)
+
+
+class TestPytestShortSummary:
+    """Every test named in pytest's short test summary survives compression."""
+
+    def test_keeps_every_short_summary_failure(self):
+        compressed = LogCompressor().compress(_pytest_log_with_failures(20)).compressed
+
+        kept = [line for line in compressed.splitlines() if line.startswith("FAILED tests/t.py::")]
+        assert [line.split("::")[1].split()[0] for line in kept] == [
+            f"test_case{i:02d}" for i in range(1, 21)
+        ]
+
+    def test_short_summary_failures_follow_keep_summary_lines(self):
+        config = LogCompressorConfig(keep_summary_lines=False)
+        compressed = LogCompressor(config).compress(_pytest_log_with_failures(20)).compressed
+
+        kept = [line for line in compressed.splitlines() if line.startswith("FAILED tests/t.py::")]
+        assert len(kept) < 20
+
+    def test_python_parser_mirrors_short_summary_classification(self):
+        lines = [
+            "FAILED tests/t.py::test_a - before the block",
+            "=========================== short test summary info ===========================",
+            "FAILED tests/t.py::test_b - AssertionError",
+            "ERROR tests/t.py::test_c - RuntimeError",
+            "=============== 1 failed, 1 error in 0.10s ===============",
+            "FAILED tests/t.py::test_d - after the block",
+        ]
+        parsed = LogCompressor()._parse_lines(lines)
+
+        assert [line.is_summary for line in parsed] == [False, True, True, True, True, False]

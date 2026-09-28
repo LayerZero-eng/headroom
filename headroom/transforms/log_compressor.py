@@ -289,6 +289,7 @@ class LogCompressor:
         log_lines: list[LogLine] = []
         in_stack_trace = False
         stack_trace_lines = 0
+        in_pytest_short_summary = False
 
         for i, line in enumerate(lines):
             log_line = LogLine(line_number=i, content=line)
@@ -314,6 +315,13 @@ class LogCompressor:
                 if pattern.search(line):
                     log_line.is_summary = True
                     break
+
+            # Mirror of Rust: each line of pytest's `short test summary info`
+            # block names a distinct test, so it is kept as a summary line.
+            if line.startswith("==="):
+                in_pytest_short_summary = "short test summary info" in line
+            elif in_pytest_short_summary and line.startswith(("FAILED ", "ERROR ")):
+                log_line.is_summary = True
 
             log_line.score = self._score_line(log_line)
             log_lines.append(log_line)

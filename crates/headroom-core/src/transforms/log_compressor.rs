@@ -896,6 +896,12 @@ fn is_summary_line(line: &str) -> bool {
     false
 }
 
+/// A result line inside pytest's `short test summary info` block, e.g.
+/// `FAILED tests/t.py::test_x - AssertionError`.
+fn is_pytest_short_summary_entry(line: &str) -> bool {
+    line.starts_with("FAILED ") || line.starts_with("ERROR ")
+}
+
 /// Extract an exception-type / error-code label from a single line, if the
 /// line looks like an exception header or error declaration. Conservative:
 /// returns `None` rather than guessing on ambiguous lines, so a generic log
@@ -1144,11 +1150,21 @@ impl LogCompressor {
         let mut out: Vec<LogLine> = Vec::with_capacity(lines.len());
         let mut active: Option<TraceFlavor> = None;
         let mut trace_lines = 0usize;
+        let mut in_pytest_short_summary = false;
 
         for (i, line) in lines.iter().enumerate() {
             let mut entry = LogLine::new(i, *line);
             entry.level = self.levels.classify(line);
             entry.is_summary = is_summary_line(line);
+
+            // pytest's `short test summary info` block lists one line per failed
+            // test. Each line names a distinct test, so treat them as summary
+            // lines rather than letting `max_errors` drop the middle of the list.
+            if line.starts_with("===") {
+                in_pytest_short_summary = line.contains("short test summary info");
+            } else if in_pytest_short_summary && is_pytest_short_summary_entry(line) {
+                entry.is_summary = true;
+            }
 
             // Stack-trace state machine: open on a new flavor match, then
             // mark subsequent lines until the flavor terminates or we hit
@@ -2036,5 +2052,98 @@ mod tests {
         let (result, stats) = c.compress(&content, 1.0);
         assert_eq!(stats.runtime_frames_collapsed, 0);
         assert!(!result.compressed.contains("frames collapsed]"));
+    }
+
+    fn pytest_log_with_failures(n_failed: usize) -> String {
+        let mut lines = vec![
+            "============================= test session starts ============================="
+                .to_string(),
+            "collected 400 items".to_string(),
+            String::new(),
+        ];
+        for i in 0..40 {
+            lines.push(format!(
+                "tests/test_module_{i:02}.py ...................................  [ {:2}%]",
+                i * 2
+            ));
+        }
+        lines.push(
+            "=================================== FAILURES =================================="
+                .into(),
+        );
+        for i in 1..=n_failed {
+            lines.push(format!(
+                "____________________ test_case{i:02} ____________________"
+            ));
+            lines.push(String::new());
+            lines.push(">       assert result == expected".into());
+            lines.push("E       AssertionError: mismatch".into());
+            lines.push(String::new());
+            lines.push("tests/t.py:42: AssertionError".into());
+        }
+        lines.push(
+            "=========================== short test summary info ==========================="
+                .into(),
+        );
+        for i in 1..=n_failed {
+            lines.push(format!(
+                "FAILED tests/t.py::test_case{i:02} - AssertionError: mismatch"
+            ));
+        }
+        lines.push(format!(
+            "=============== {n_failed} failed, 380 passed in 41.02s =============="
+        ));
+        lines.join("\n")
+    }
+
+    fn kept_short_summary_failures(compressed: &str) -> Vec<String> {
+        compressed
+            .lines()
+            .filter(|l| l.starts_with("FAILED tests/t.py::"))
+            .map(str::to_string)
+            .collect()
+    }
+
+    #[test]
+    fn keeps_every_pytest_short_summary_failure() {
+        let content = pytest_log_with_failures(20);
+        let (result, _) = cmp().compress(&content, 1.0);
+        let kept = kept_short_summary_failures(&result.compressed);
+        assert_eq!(kept.len(), 20, "{}", result.compressed);
+        for i in 1..=20 {
+            assert!(
+                kept.iter()
+                    .any(|l| l.contains(&format!("test_case{i:02} "))),
+                "test_case{i:02} missing from:\n{}",
+                result.compressed
+            );
+        }
+    }
+
+    #[test]
+    fn short_summary_failures_follow_keep_summary_lines() {
+        let content = pytest_log_with_failures(20);
+        let cfg = LogCompressorConfig {
+            keep_summary_lines: false,
+            ..LogCompressorConfig::default()
+        };
+        let (result, _) = LogCompressor::new(cfg).compress(&content, 1.0);
+        assert!(kept_short_summary_failures(&result.compressed).len() < 20);
+    }
+
+    #[test]
+    fn failed_lines_outside_short_summary_are_not_summary_lines() {
+        let c = cmp();
+        let lines = [
+            "FAILED tests/t.py::test_a - before the block",
+            "=========================== short test summary info ===========================",
+            "FAILED tests/t.py::test_b - AssertionError",
+            "ERROR tests/t.py::test_c - RuntimeError",
+            "=============== 1 failed, 1 error in 0.10s ===============",
+            "FAILED tests/t.py::test_d - after the block",
+        ];
+        let parsed = c.parse_lines(&lines);
+        let summary: Vec<bool> = parsed.iter().map(|l| l.is_summary).collect();
+        assert_eq!(summary, vec![false, true, true, true, true, false]);
     }
 }
