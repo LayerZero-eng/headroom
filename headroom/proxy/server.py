@@ -178,6 +178,11 @@ from headroom.proxy.project_context import (
     strip_project_path_prefix,
 )
 from headroom.proxy.prometheus_metrics import PrometheusMetrics  # noqa: F401
+from headroom.proxy.proxy_credential import (
+    ProxyCredentialScrubMiddleware,
+    install_upstream_credential_guard,
+    resolve_proxy_token,
+)
 from headroom.proxy.rate_limiter import TokenBucketRateLimiter  # noqa: F401
 from headroom.proxy.request_logger import RequestLogger  # noqa: F401
 from headroom.proxy.savings_tracker import LITELLM_AVAILABLE
@@ -1986,15 +1991,23 @@ class HeadroomProxy(
         # honour a pin at all — a proxy resolves the target itself, on its own
         # network. Operator-configured upstreams have no pin and are untouched,
         # so trust_env, limits, HTTP/2 and connection reuse are unchanged.
-        self.http_client = install_upstream_pinning(
-            httpx.AsyncClient(http2=_http2, **_client_kwargs)
+        # The credential guard is defence in depth behind the inbound scrub
+        # (ProxyCredentialScrubMiddleware): no upstream request made through the
+        # shared clients may carry HEADROOM_PROXY_TOKEN in any header.
+        _proxy_token = resolve_proxy_token(self.config)
+        self.http_client = install_upstream_credential_guard(
+            install_upstream_pinning(httpx.AsyncClient(http2=_http2, **_client_kwargs)),
+            _proxy_token,
         )
         # Reuse the primary client when HTTP/2 is already off; otherwise keep a
         # dedicated HTTP/1.1 client for ChatGPT passthrough.
         self.http_client_h1 = (
             self.http_client
             if not _http2
-            else install_upstream_pinning(httpx.AsyncClient(http2=False, **_client_kwargs))
+            else install_upstream_credential_guard(
+                install_upstream_pinning(httpx.AsyncClient(http2=False, **_client_kwargs)),
+                _proxy_token,
+            )
         )
         logger.info("Headroom Proxy started (version %s)", __version__)
         logger.info(f"Optimization: {'ENABLED' if self.config.optimize else 'DISABLED'}")
@@ -3234,6 +3247,11 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
         version=__version__,
         lifespan=lifespan,
     )
+    # Innermost layer, so registered first (Starlette prepends): strip the proxy
+    # credential from every request after the security gate and extensions have
+    # seen it, before any handler, backend or relay can forward it upstream.
+    # See headroom/proxy/proxy_credential.py.
+    app.add_middleware(ProxyCredentialScrubMiddleware, proxy_token=resolve_proxy_token(config))
     app.add_middleware(WebSocketProjectPrefixMiddleware)
     loop_health_state: LoopHealthState = {
         "status": "healthy",
@@ -3815,7 +3833,7 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
     # headers, and an audit trail for state-mutating admin endpoints.
     # WebSocket handshakes are covered separately — see the
     # WebSocketAuthMiddleware registration just below this block.
-    _proxy_token = config.proxy_token or os.environ.get("HEADROOM_PROXY_TOKEN") or None
+    _proxy_token = resolve_proxy_token(config)
     # Pre-encode once for constant-time comparison (compare_digest on str raises
     # TypeError for non-ASCII input, which would turn a 401 into a 500).
     _proxy_token_bytes = _proxy_token.encode("utf-8") if _proxy_token else b""

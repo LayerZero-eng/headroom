@@ -12,8 +12,11 @@ headroom proxy
 
 # Deliberate public access, with the existing token protocol
 HEADROOM_PROXY_TOKEN='replace-with-a-secret' headroom proxy --host 0.0.0.0 --port 8080
-# Send `Authorization: Bearer replace-with-a-secret` or
-# `X-Headroom-Proxy-Token: replace-with-a-secret` from the caller.
+# Send `X-Headroom-Proxy-Token: replace-with-a-secret` from the caller, and the
+# provider key in `Authorization` / `x-api-key` as usual. The proxy token is
+# removed before anything is forwarded upstream; it never reaches the provider.
+# (`Authorization: Bearer replace-with-a-secret` is also accepted, but then the
+# request carries no provider key and the provider will answer 401.)
 
 # With logging and budget
 headroom proxy \
