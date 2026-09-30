@@ -27,6 +27,7 @@ import argparse
 import asyncio
 import concurrent.futures
 import contextlib
+import contextvars
 import hmac
 import ipaddress
 import json
@@ -1563,6 +1564,7 @@ class HeadroomProxy(
 
         loop = asyncio.get_running_loop()
         queued_at = time.monotonic()
+        request_context = contextvars.copy_context()
         state = {
             "queued": True,
             "started": False,
@@ -1630,7 +1632,7 @@ class HeadroomProxy(
             if quarantine_activated:
                 _announce_quarantine()
             try:
-                return fn()
+                return request_context.run(fn)
             finally:
                 elapsed = time.monotonic() - started_at
                 with self._compression_metrics_lock:
