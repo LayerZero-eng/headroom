@@ -159,8 +159,11 @@ def test_jsonl_storage_round_trip_query_count_and_summary(tmp_path: Path) -> Non
     assert storage.get("two") == second
     assert storage.get("missing") is None
 
+    # Pages are slices of the full filtered set sorted newest-first, matching
+    # SQLiteStorage (ORDER BY timestamp DESC LIMIT/OFFSET, #3822): the sorted
+    # matches are ["three", "two"], so offset=1/limit=1 returns ["two"].
     results = storage.query(start_time=now - timedelta(hours=1, minutes=30), offset=1, limit=1)
-    assert [item.request_id for item in results] == ["three"]
+    assert [item.request_id for item in results] == ["two"]
     assert storage.query(model="claude")[0].request_id == "two"
     assert storage.query(mode="optimize")[0].request_id == "two"
     assert storage.query(end_time=now - timedelta(hours=1, minutes=30))[0].request_id == "one"
@@ -211,6 +214,37 @@ def test_jsonl_storage_handles_missing_file_malformed_lines_and_defaults(tmp_pat
     assert loaded[0].turns_dropped == 0
     assert loaded[0].messages_hash == ""
     assert loaded[0].error is None
+
+
+def test_jsonl_query_pages_match_sqlite_newest_first(tmp_path: Path) -> None:
+    """Both backends must agree on which rows a page contains (#3822).
+
+    Rows are saved oldest-first (append order). A page is defined over the
+    full filtered set, sorted by timestamp descending, THEN sliced - the
+    jsonl backend used to apply offset/limit during the append-order read
+    and returned the OLDEST rows while sqlite returned the NEWEST.
+    """
+    base = datetime(2026, 9, 20)
+    jsonl = JSONLStorage(str(tmp_path / "metrics.jsonl"))
+    sqlite = SQLiteStorage(str(tmp_path / "metrics.db"))
+    try:
+        for i in range(250):
+            metrics = _metrics(f"req-{i:03d}", base + timedelta(minutes=i))
+            jsonl.save(metrics)
+            sqlite.save(metrics)
+
+        for limit, offset in ((5, 0), (5, 5), (100, 200), (7, 243), (10, 245)):
+            expected = [r.request_id for r in sqlite.query(limit=limit, offset=offset)]
+            actual = [r.request_id for r in jsonl.query(limit=limit, offset=offset)]
+            assert actual == expected
+
+        # The first page holds the NEWEST rows on both backends.
+        newest_first = [f"req-{i:03d}" for i in range(249, 244, -1)]
+        assert [r.request_id for r in jsonl.query(limit=5)] == newest_first
+        assert [r.request_id for r in sqlite.query(limit=5)] == newest_first
+    finally:
+        jsonl.close()
+        sqlite.close()
 
 
 def test_sqlite_storage_round_trip_filters_summary_and_defaults(tmp_path: Path) -> None:

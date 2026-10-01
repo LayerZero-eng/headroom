@@ -101,9 +101,14 @@ class JSONLStorage(Storage):
         limit: int = 100,
         offset: int = 0,
     ) -> list[RequestMetrics]:
-        """Query metrics with filters."""
+        """Query metrics with filters.
+
+        Paging is defined over the full filtered, timestamp-sorted result
+        set, matching ``SQLiteStorage``'s ``ORDER BY timestamp DESC LIMIT ?
+        OFFSET ?``: sort first, then slice. Paging during the append-order
+        read returned the oldest rows instead of the newest (#3822).
+        """
         results: list[RequestMetrics] = []
-        skipped = 0
 
         for metrics in self.iter_all():
             # Apply filters
@@ -116,20 +121,11 @@ class JSONLStorage(Storage):
             if mode is not None and metrics.mode != mode:
                 continue
 
-            # Handle offset
-            if skipped < offset:
-                skipped += 1
-                continue
-
             results.append(metrics)
 
-            # Handle limit
-            if len(results) >= limit:
-                break
-
-        # Sort by timestamp descending
+        # Sort by timestamp descending, then apply offset/limit.
         results.sort(key=lambda m: m.timestamp, reverse=True)
-        return results
+        return results[offset : offset + limit]
 
     def count(
         self,
