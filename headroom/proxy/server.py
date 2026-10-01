@@ -697,7 +697,10 @@ def _apply_stateless_persistence(config: ProxyConfig) -> None:
     files are written to the workspace.
 
     Covers TOIN (the always-on serving writer): it keeps learning patterns
-    in-memory but never reads or writes ``toin.json``. An empty ``storage_path``
+    in-memory but never reads or writes ``toin.json``. Also resets the CCR
+    retrieval store so it is rebuilt in-memory (see below). Every other
+    workspace writer consults ``paths.persistence_allowed()`` at its write
+    site, so it needs no special handling here. An empty ``storage_path``
     makes the backend ``None``, which no-ops load/save/auto-save. The savings
     subsystem is handled separately via ``PrometheusMetrics(stateless=...)``.
 
@@ -717,12 +720,19 @@ def _apply_stateless_persistence(config: ProxyConfig) -> None:
     """
     if not getattr(config, "stateless", False):
         return
+    from headroom.cache.compression_store import reset_compression_store
     from headroom.telemetry.toin import TOINConfig, get_toin, reset_toin
 
     # Reset first so this wins regardless of whether the singleton was already
     # created with a filesystem backend earlier in the process.
     reset_toin()
     get_toin(TOINConfig(storage_path=""))
+    # Same for the CCR retrieval store: drop any singleton built before the
+    # stateless flag was recorded so the next get_compression_store() goes
+    # through _create_default_ccr_backend(), which refuses the SQLite file in
+    # stateless mode. The store holds verbatim tool output — the one thing a
+    # stateless deployment most needs kept off disk.
+    reset_compression_store()
 
 
 def _provider_httpx_client_options(

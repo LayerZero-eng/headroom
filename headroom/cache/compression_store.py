@@ -1114,11 +1114,24 @@ def _create_default_ccr_backend() -> CompressionStoreBackend | None:
     "memory" opts back into the in-process dict. Other values load
     adapters via setuptools entry point 'headroom.ccr_backend'.
     Returns None to use InMemoryBackend.
+
+    Stateless mode (``--stateless`` / ``HEADROOM_STATELESS``) never opens the
+    SQLite file: the entries it would hold are the verbatim tool outputs that
+    stateless deployments run stateless to keep off disk. The default and an
+    explicit ``sqlite`` both fall back to the in-process store (retrieval then
+    does not survive a restart or cross workers, which is the documented
+    stateless trade-off). A named entry-point backend is still honoured — the
+    operator chose it explicitly, and it is how a stateless multi-worker
+    deployment gets a non-file (e.g. redis) store.
     """
+    from ..paths import persistence_allowed
+
     backend_type = (os.environ.get("HEADROOM_CCR_BACKEND") or "").strip().lower()
     if backend_type == "memory":
         return None
     if not backend_type or backend_type == "sqlite":
+        if not persistence_allowed("CCR retrieval store (ccr_store.db)"):
+            return None
         try:
             from .backends.sqlite import SQLiteBackend
 
