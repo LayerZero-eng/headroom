@@ -29,6 +29,7 @@ from typing import TYPE_CHECKING, Any
 
 import httpx
 
+from headroom import fileperms as _fileperms
 from headroom import paths as _paths
 
 if TYPE_CHECKING:
@@ -363,8 +364,9 @@ class UsageReporter:
             return
         try:
             self._cache_path.parent.mkdir(parents=True, exist_ok=True)
-            self._cache_path.write_text(
-                json.dumps(self._license_info.to_dict(), indent=2), encoding="utf-8"
+            # Owner-only: the envelope names the org and plan.
+            _fileperms.write_private_text(
+                self._cache_path, json.dumps(self._license_info.to_dict(), indent=2)
             )
         except OSError:
             logger.warning("Could not save license cache to %s", self._cache_path)

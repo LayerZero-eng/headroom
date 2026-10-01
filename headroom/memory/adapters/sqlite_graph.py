@@ -22,6 +22,7 @@ from pathlib import Path
 from threading import RLock
 from typing import TYPE_CHECKING, Any
 
+from ...fileperms import connect_private_sqlite
 from .graph_models import Entity, Relationship, RelationshipDirection, Subgraph
 
 if TYPE_CHECKING:
@@ -80,7 +81,7 @@ class SQLiteGraphStore:
         Returns:
             A new SQLite connection with row factory configured.
         """
-        conn = sqlite3.connect(str(self.db_path))
+        conn = connect_private_sqlite(self.db_path, what="memory graph store")
         conn.row_factory = sqlite3.Row
 
         # Configure page cache size (negative = KB, positive = pages)

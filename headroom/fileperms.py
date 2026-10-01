@@ -3,8 +3,23 @@
 Headroom's runtime log (``~/.headroom/logs/proxy-<port>.log``) and the optional
 JSONL request log can both carry verbatim request and response content: wire
 debug dumps, ``--log-messages`` bodies, and — when an operator opts in — CCR
-payload previews. None of that should be created at the process umask, which on
-a stock developer machine means ``0644``: world-readable.
+payload previews. The CCR retrieval store holds verbatim tool output, and the
+memory databases hold facts extracted from conversations together with the
+user id they belong to. None of that should be created at the process umask,
+which on a stock developer machine means ``0644``: world-readable.
+
+This module is the one place that knows how to create such a file privately,
+so every store uses the same rules and a reviewer can read the guarantee off
+one file. Extensions that keep their own state (Shield, Foresight, Kiro, the
+router) should call these helpers rather than ``sqlite3.connect`` /
+``Path.write_text`` directly:
+
+* :func:`open_owner_only` — open a log or text file for append or write.
+* :func:`write_private_text` — write a whole text file (licence cache, JSON).
+* :func:`ensure_private_file` — make a path a private regular file *before*
+  a library that opens by path (sqlite) touches it.
+* :func:`connect_private_sqlite` — ``sqlite3.connect`` through the above.
+* :func:`private_dir` — create a directory that will hold such files.
 
 Scope of the guarantee — read this before citing it in a threat model:
 
@@ -34,19 +49,24 @@ a kernel-enforced one.
 from __future__ import annotations
 
 import os
+import sqlite3
 import stat
+from pathlib import Path
 from typing import IO, Any
 
 #: Mode for every runtime file Headroom creates that may hold request content.
 OWNER_ONLY_MODE = 0o600
+
+#: Mode for directories that hold such files.
+OWNER_ONLY_DIR_MODE = 0o700
 
 #: ``True`` only where the mode bits above actually decide who can read the
 #: file. See the module docstring for why Windows is excluded.
 OWNER_ONLY_SUPPORTED = os.name == "posix"
 
 
-def _open_flags() -> int:
-    flags = os.O_CREAT | os.O_WRONLY | os.O_APPEND
+def _open_flags(*, truncate: bool = False) -> int:
+    flags = os.O_CREAT | os.O_WRONLY | (os.O_TRUNC if truncate else os.O_APPEND)
     # Refuse to open through a symlink where the platform can enforce it, so a
     # planted link cannot redirect either the write or the chmod. Absent on
     # Windows, where getattr() leaves the flag out.
@@ -98,14 +118,16 @@ def open_owner_only(
     encoding: str | None = None,
     errors: str | None = None,
 ) -> IO[Any]:
-    """Open *path* for append, creating it owner-only.
+    """Open *path* for append (``"a"``) or write (``"w"``), creating it owner-only.
 
     Raises ``OSError`` — which every caller already treats as "logging is
     unavailable, carry on" — if the path cannot be opened, including when it is
     a symlink on a platform with ``O_NOFOLLOW``. Failing closed is deliberate:
     a redirected sensitive log is worse than no log.
     """
-    fd = os.open(path, _open_flags(), OWNER_ONLY_MODE)
+    if mode[:1] not in ("a", "w"):
+        raise ValueError(f"open_owner_only: mode must start with 'a' or 'w', got {mode!r}")
+    fd = os.open(path, _open_flags(truncate=mode.startswith("w")), OWNER_ONLY_MODE)
     try:
         restrict_fd_to_owner(fd)
         return open(fd, mode, encoding=encoding, errors=errors, closefd=True)
@@ -116,3 +138,134 @@ def open_owner_only(
             # open() can have taken and closed the descriptor on its way out.
             pass
         raise
+
+
+def write_private_text(
+    path: str | os.PathLike[str],
+    text: str,
+    *,
+    encoding: str = "utf-8",
+) -> None:
+    """Replace the contents of *path* with *text*, owner-only.
+
+    For small state files whose contents are sensitive (the licence validation
+    cache, vector-index metadata). Same failure rules as :func:`open_owner_only`.
+    """
+    with open_owner_only(path, "w", encoding=encoding) as fh:
+        fh.write(text)
+
+
+def ensure_private_file(path: str | os.PathLike[str], *, what: str = "file") -> None:
+    """Make *path* an owner-only regular file before a by-path opener touches it.
+
+    For libraries that open files by path and create them at the umask —
+    sqlite above all. Creating the file here first, with an explicit
+    ``0o600`` mode, means a *new* database is private from birth (sqlite
+    treats an empty file as a fresh database, and creates its ``-wal`` /
+    ``-shm`` sidecars with the same mode as the main file). A pre-existing
+    file left wide by an earlier run is narrowed.
+
+    Fails **closed**: a store of conversation or tool content must not be
+    opened world-readable, so a failure to create or narrow the file privately
+    raises :class:`PermissionError` rather than proceeding to open a wide
+    file. The existing-file path is symlink-race resistant — ``O_EXCL`` on the
+    create refuses to reuse a planted file or symlink; an existing file is
+    re-opened with ``O_NOFOLLOW`` and narrowed through that descriptor
+    (``fstat`` to confirm a regular file, ``fchmod`` to set the mode) rather
+    than by re-resolving the path, which closes the check-then-chmod TOCTOU a
+    ``chmod(path)`` would leave open. On Windows POSIX mode bits and
+    ``O_NOFOLLOW`` do not apply, so there is nothing to narrow (see the module
+    docstring for what is and is not claimed there).
+
+    *what* names the store in the error message.
+    """
+    create_flags = os.O_CREAT | os.O_EXCL | os.O_WRONLY
+    if hasattr(os, "O_NOFOLLOW"):
+        create_flags |= os.O_NOFOLLOW
+    try:
+        os.close(os.open(path, create_flags, OWNER_ONLY_MODE))
+        return
+    except FileExistsError:
+        pass
+
+    if not (hasattr(os, "O_NOFOLLOW") and hasattr(os, "fchmod")):
+        return
+
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+    except OSError as exc:
+        raise PermissionError(
+            f"refusing to open {what} at {path}: not a regular file (symlink or open error: {exc})"
+        ) from exc
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            raise PermissionError(f"refusing to open {what} at {path}: not a regular file")
+        # os.fchmod is POSIX-only (guarded by the hasattr check above); the
+        # ignore keeps type-checking clean on Windows where it is absent.
+        os.fchmod(fd, OWNER_ONLY_MODE)  # type: ignore[attr-defined]
+    finally:
+        os.close(fd)
+
+
+def _is_sqlite_uri_or_memory(path: str | os.PathLike[str]) -> bool:
+    """``:memory:`` and ``file:`` URIs are not filesystem paths to make private."""
+    text = os.fspath(path)
+    return text == ":memory:" or text.startswith("file:")
+
+
+def connect_private_sqlite(
+    path: str | os.PathLike[str],
+    *,
+    what: str = "database",
+    **connect_kwargs: Any,
+) -> sqlite3.Connection:
+    """``sqlite3.connect`` that first makes the database file owner-only.
+
+    Drop-in for ``sqlite3.connect(str(path), **kwargs)`` at every store that
+    holds conversation-derived content. ``:memory:`` databases and ``file:``
+    URIs (``uri=True``) are passed straight through — they are not paths this
+    module should create. The parent directory must already exist; create it
+    with :func:`private_dir` if it is dedicated to this store.
+    """
+    if not (connect_kwargs.get("uri") or _is_sqlite_uri_or_memory(path)):
+        ensure_private_file(path, what=what)
+    # ``**connect_kwargs: Any`` makes mypy type the call as ``Any``; the
+    # annotation pins it back to the real return type.
+    conn: sqlite3.Connection = sqlite3.connect(os.fspath(path), **connect_kwargs)
+    return conn
+
+
+def private_dir(path: str | os.PathLike[str], *, tighten: bool = False) -> Path:
+    """Create *path* (and missing parents) as a directory for private files.
+
+    The leaf is created ``0o700``; parents that have to be created get the
+    same mode. With ``tighten=True`` an *existing* leaf directory is narrowed
+    to ``0o700`` as well — use that for a directory that exists only to hold
+    Headroom's sensitive files (the native memory directory), not for a shared
+    workspace root whose mode the operator may have set deliberately. A
+    symlink at the leaf is left alone: the target is not ours to re-permission.
+    Returns the path.
+    """
+    target = Path(path)
+    if not target.exists():
+        # mkdir's mode is masked by the umask; set it explicitly afterwards on
+        # what we created. Parents created here are ours too.
+        missing: list[Path] = []
+        probe = target
+        while not probe.exists():
+            missing.append(probe)
+            if probe.parent == probe:
+                break
+            probe = probe.parent
+        target.mkdir(parents=True, exist_ok=True)
+        if OWNER_ONLY_SUPPORTED:
+            for created in missing:
+                try:
+                    os.chmod(created, OWNER_ONLY_DIR_MODE)
+                except OSError:
+                    pass
+        return target
+    if tighten and OWNER_ONLY_SUPPORTED and target.is_dir() and not target.is_symlink():
+        if stat.S_IMODE(target.stat().st_mode) != OWNER_ONLY_DIR_MODE:
+            os.chmod(target, OWNER_ONLY_DIR_MODE)
+    return target

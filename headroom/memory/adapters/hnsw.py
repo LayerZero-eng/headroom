@@ -22,6 +22,7 @@ from typing import TYPE_CHECKING, Any
 
 import numpy as np
 
+from ...fileperms import open_owner_only
 from ..models import Memory, ScopeLevel, normalize_entity_refs
 from ..ports import VectorFilter, VectorSearchResult
 
@@ -829,7 +830,9 @@ class HNSWVectorIndex:
                 "embeddings": {mid: emb.tolist() for mid, emb in self._embeddings.items()},
             }
 
-            with open(meta_path, "w") as f:
+            # Memory metadata and raw embeddings: owner-only, like every other
+            # memory store file.
+            with open_owner_only(meta_path, "w") as f:
                 json.dump(meta_data, f)
 
     def load_index(self, path: str | Path) -> None:

@@ -16,6 +16,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
+from ...fileperms import connect_private_sqlite
 from ..models import Memory, ScopeLevel, normalize_entity_refs
 from ..ports import MemoryFilter
 
@@ -76,10 +77,13 @@ class SQLiteMemoryStore:
     def _get_conn(self) -> sqlite3.Connection:
         """Get a new database connection (thread-safe pattern).
 
+        The file is created, or narrowed, owner-only before sqlite opens it:
+        it holds memory content and the user ids it belongs to.
+
         Returns:
             A new SQLite connection with row factory configured.
         """
-        conn = sqlite3.connect(str(self.db_path))
+        conn = connect_private_sqlite(self.db_path, what="memory store")
         conn.row_factory = sqlite3.Row
         return conn
 
