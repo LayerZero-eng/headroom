@@ -1,6 +1,17 @@
 """Token bucket rate limiter for the Headroom proxy.
 
-Rate limits requests and token usage per API key or IP address.
+Rate limits requests and token usage per identity. Handlers pass a
+:class:`~headroom.proxy.rate_limit_identity.RateLimitIdentity` (see that module
+for who a request is charged to); a plain string is still accepted and treated
+as a trusted identity that owns itself.
+
+Bucket bookkeeping is built so an attacker cannot flush other callers' state:
+
+* trusted and untrusted identities live in **separate** bounded LRU pools, so a
+  flood of unauthenticated peers cannot evict an authenticated caller's bucket;
+* one owner (a peer) can hold at most ``MAX_BUCKETS_PER_OWNER`` buckets in a
+  pool; past that its new identities share one overflow bucket instead of
+  evicting anyone else's.
 
 Extracted from server.py for maintainability.
 """
@@ -12,10 +23,16 @@ import time
 from collections import OrderedDict
 
 from headroom.proxy.models import RateLimitState
+from headroom.proxy.rate_limit_identity import RateLimitIdentity
 from headroom.proxy.rate_limit_policy import consume_from_bucket, refilled_tokens
 
-# Maximum rate limiter buckets (prevents DoS via spoofed API keys)
+# Maximum rate limiter buckets per pool (prevents memory DoS via spoofed keys).
 MAX_RATE_LIMITER_BUCKETS = 1000
+# Maximum distinct buckets one owner (peer) may hold in a pool before its new
+# identities fold into a single overflow bucket.
+MAX_BUCKETS_PER_OWNER = 32
+
+_UNTRUSTED_PREFIX = "untrusted/"
 
 
 class TokenBucketRateLimiter:
@@ -29,24 +46,56 @@ class TokenBucketRateLimiter:
         self.requests_per_minute = requests_per_minute
         self.tokens_per_minute = tokens_per_minute
 
-        # Per-key buckets (key = API key or IP). A shared LRU keeps request and
-        # token state on the same bounded lifecycle without scanning all keys.
+        # Request and token state share one bounded lifecycle per bucket, and no
+        # hot-path operation scans all identities. ``_bucket_lru`` is the trusted
+        # pool; untrusted buckets are namespaced and live in their own LRU.
         self._request_buckets: dict[str, RateLimitState] = {}
         self._token_buckets: dict[str, RateLimitState] = {}
         self._bucket_lru: OrderedDict[str, None] = OrderedDict()
+        self._untrusted_lru: OrderedDict[str, None] = OrderedDict()
+        self._bucket_owner: dict[str, str] = {}
+        self._owner_buckets: dict[str, int] = {}
         self._lock = asyncio.Lock()
 
-    def _touch_bucket(self, key: str) -> None:
-        """Mark a bucket active, evicting the least-recently-used key at capacity."""
-        if key in self._bucket_lru:
-            self._bucket_lru.move_to_end(key)
-            return
+    def _touch_bucket(self, identity: str | RateLimitIdentity) -> str:
+        """Resolve ``identity`` to a bucket name, mark it active, and return it.
 
-        if len(self._bucket_lru) >= MAX_RATE_LIMITER_BUCKETS:
-            evicted_key, _ = self._bucket_lru.popitem(last=False)
-            self._request_buckets.pop(evicted_key, None)
-            self._token_buckets.pop(evicted_key, None)
-        self._bucket_lru[key] = None
+        Evicts the least-recently-used bucket of the same pool at capacity, and
+        folds an owner's identities into one overflow bucket once it holds
+        ``MAX_BUCKETS_PER_OWNER``.
+        """
+        if isinstance(identity, str):
+            identity = RateLimitIdentity(bucket=identity, owner=identity, pool="trusted")
+        untrusted = identity.pool == "untrusted"
+        lru = self._untrusted_lru if untrusted else self._bucket_lru
+        prefix = _UNTRUSTED_PREFIX if untrusted else ""
+        owner_key = f"{identity.pool}:{identity.owner}"
+
+        name = prefix + identity.bucket
+        if name in lru:
+            lru.move_to_end(name)
+            return name
+        if self._owner_buckets.get(owner_key, 0) >= MAX_BUCKETS_PER_OWNER:
+            name = f"{prefix}{identity.owner}#overflow"
+            if name in lru:
+                lru.move_to_end(name)
+                return name
+
+        if len(lru) >= MAX_RATE_LIMITER_BUCKETS:
+            evicted, _ = lru.popitem(last=False)
+            self._request_buckets.pop(evicted, None)
+            self._token_buckets.pop(evicted, None)
+            evicted_owner = self._bucket_owner.pop(evicted, None)
+            if evicted_owner is not None:
+                remaining = self._owner_buckets.get(evicted_owner, 1) - 1
+                if remaining > 0:
+                    self._owner_buckets[evicted_owner] = remaining
+                else:
+                    self._owner_buckets.pop(evicted_owner, None)
+        lru[name] = None
+        self._bucket_owner[name] = owner_key
+        self._owner_buckets[owner_key] = self._owner_buckets.get(owner_key, 0) + 1
+        return name
 
     def _request_bucket(self, key: str) -> RateLimitState:
         state = self._request_buckets.get(key)
@@ -74,11 +123,11 @@ class TokenBucketRateLimiter:
         state.last_update = now
         return state.tokens
 
-    async def check_request(self, key: str = "default") -> tuple[bool, float]:
+    async def check_request(self, key: str | RateLimitIdentity = "default") -> tuple[bool, float]:
         """Check if request is allowed. Returns (allowed, wait_seconds)."""
         async with self._lock:
-            self._touch_bucket(key)
-            state = self._request_bucket(key)
+            bucket = self._touch_bucket(key)
+            state = self._request_bucket(bucket)
             available = self._refill(state, self.requests_per_minute)
 
             allowed, state.tokens, wait_seconds = consume_from_bucket(
@@ -88,14 +137,16 @@ class TokenBucketRateLimiter:
             )
             return allowed, wait_seconds
 
-    async def check_tokens(self, key: str, token_count: int) -> tuple[bool, float]:
+    async def check_tokens(
+        self, key: str | RateLimitIdentity, token_count: int
+    ) -> tuple[bool, float]:
         """Check if token usage is allowed. ``tokens_per_minute=None`` never limits."""
         tpm = self.tokens_per_minute
         if tpm is None:
             return True, 0.0
         async with self._lock:
-            self._touch_bucket(key)
-            state = self._token_bucket(key, tpm)
+            bucket = self._touch_bucket(key)
+            state = self._token_bucket(bucket, tpm)
             available = self._refill(state, tpm)
 
             allowed, state.tokens, wait_seconds = consume_from_bucket(
@@ -111,5 +162,5 @@ class TokenBucketRateLimiter:
             return {
                 "requests_per_minute": self.requests_per_minute,
                 "tokens_per_minute": self.tokens_per_minute,
-                "active_keys": len(self._bucket_lru),
+                "active_keys": len(self._bucket_lru) + len(self._untrusted_lru),
             }
