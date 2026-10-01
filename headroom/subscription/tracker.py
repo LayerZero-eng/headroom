@@ -179,11 +179,15 @@ class SubscriptionTracker(QuotaTracker):
     # Proxy integration hooks
     # ------------------------------------------------------------------
 
-    def notify_active(self, token: str) -> None:
+    def notify_active(self, token: str, *, from_local_operator: bool = False) -> None:
         """Called by the proxy handler when an OAuth request comes through.
 
-        Stores the token for polling and marks the tracker as recently active.
-        Only processes Bearer tokens that look like OAuth (not API keys).
+        Marks the tracker as recently active. The caller's bearer is remembered
+        for polling **only** when ``from_local_operator`` is true — the handler
+        passes :func:`headroom.subscription.credential_policy.may_adopt_caller_credential`.
+        A network caller on a shared proxy never becomes the polled account
+        (VAPT 01-F16). Only Bearer tokens that look like OAuth (not API keys)
+        are considered.
         """
         if not token or not token.startswith("Bearer "):
             return
@@ -192,8 +196,10 @@ class SubscriptionTracker(QuotaTracker):
         if raw.startswith("sk-ant-api"):
             return
         with self._lock:
-            self._current_token = raw
             self._state.last_active_at = _utc_now()
+            if not from_local_operator:
+                return
+            self._current_token = raw
             prefix = raw[:8]
             self._full_tokens[prefix] = self._full_tokens.get(prefix, 0) + 1
 
@@ -391,16 +397,20 @@ class SubscriptionTracker(QuotaTracker):
     async def _maybe_poll(self) -> None:
         with self._lock:
             is_active = self._state.is_active(active_window_s=self._active_window_s)
-            token = self._current_token
+            learned_token = self._current_token
 
-        if not is_active:
-            # Try background poll using credentials file token
-            from headroom.subscription.client import read_cached_oauth_token
+        # The operator-configured credential (CLAUDE_CODE_OAUTH_TOKEN or the
+        # proxy user's own credentials file) always wins; a token learned from
+        # local-operator traffic is only the fallback (VAPT 01-F16).
+        from headroom.subscription.client import read_cached_oauth_token
 
-            bg_token = read_cached_oauth_token()
-            if not bg_token:
-                return
-            token = token or bg_token
+        token = read_cached_oauth_token() or learned_token
+        if not token:
+            return
+        if not is_active and learned_token is not None and token == learned_token:
+            # Idle and no operator credential: don't keep polling with a
+            # learned token after its owner went quiet.
+            return
 
         snapshot = await self._client.fetch(token)
         if snapshot is None:
