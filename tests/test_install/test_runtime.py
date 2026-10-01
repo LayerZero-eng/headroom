@@ -100,6 +100,12 @@ def test_build_runtime_command_for_docker_includes_deployment_env(
     assert "HEADROOM_DEPLOYMENT_PRESET=persistent-docker" in joined
     assert "127.0.0.1:8787:8787" in joined
     assert "ghcr.io/headroomlabs-ai/headroom:latest" in command
+    # The container binds 0.0.0.0 behind a loopback-only publication; the
+    # proxy refuses that bind without a token unless acknowledged, and this
+    # launcher is the canonical case for the acknowledgement.
+    assert "--host 0.0.0.0" in joined
+    assert "HEADROOM_ALLOW_UNAUTHENTICATED_BIND=1" in command
+    assert command[command.index("HEADROOM_ALLOW_UNAUTHENTICATED_BIND=1") - 1] == "--env"
     # Canonical Headroom filesystem contract (issue #175) forwarded into
     # the container.
     assert "HEADROOM_WORKSPACE_DIR=/tmp/headroom-home/.headroom" in command

@@ -333,7 +333,8 @@ with a privileged job.
 
 | Flag / env | Default | Effect |
 |---|---|---|
-| `HEADROOM_PROXY_TOKEN` | none | Require a bearer token (`X-Headroom-Proxy-Token`) from non-loopback callers. |
+| `HEADROOM_PROXY_TOKEN` | none | Require a bearer token (`X-Headroom-Proxy-Token`) from non-loopback callers. Also gates the read-only operator routes (`/dashboard`, `/stats-history`, `/quota`, `/subscription-window`, `/metrics`), which otherwise answer loopback and trusted-CIDR callers only. |
+| `HEADROOM_ALLOW_UNAUTHENTICATED_BIND` | `false` | Acknowledge a non-loopback bind (`--host 0.0.0.0`, `::`, a LAN address) with **no** `HEADROOM_PROXY_TOKEN`. Without a token or this flag the proxy refuses to start, because `/v1/*` would relay upstream with the operator's credentials for every peer that can reach the port. Only set it when the runtime already restricts reachability (a container published on `127.0.0.1`). |
 | `HEADROOM_COMPRESS_ALLOW_REMOTE` | `false` | Allow non-loopback callers to reach [`POST /v1/compress`](#post-v1compress) and `POST /v1/usage`. Required to run Headroom as a remote gateway/sidecar; without it remote callers get `404`. |
 | `--offline` / `HEADROOM_OFFLINE` | `false` | Air-gap mode: hard-disable **all** egress (telemetry, update checks, license reporting, model downloads). |
 | `--stateless` / `HEADROOM_STATELESS` | `false` | Keep all state in memory; no filesystem writes (disables logs, memory, TOIN). |

@@ -147,7 +147,7 @@ from headroom.proxy.helpers import (
     retry_after_ms,
 )
 from headroom.proxy.loop_callback_failure_policy import is_known_websocket_callback_failure
-from headroom.proxy.loopback_guard import is_loopback_host
+from headroom.proxy.loopback_guard import is_loopback_host, is_loopback_host_header
 from headroom.proxy.malloc_trim import trim_periodically
 from headroom.proxy.memory_handler import MemoryConfig, MemoryHandler
 
@@ -2866,12 +2866,6 @@ class WebSocketAuthMiddleware:
             await self.app(scope, receive, send)
             return
 
-        client = scope.get("client")
-        client_host = client[0] if client else None
-        if is_loopback_host(client_host):
-            await self.app(scope, receive, send)
-            return
-
         # Starlette's own Headers rather than a hand-built dict: on a repeated
         # header it returns the FIRST occurrence, which is what the HTTP gate
         # sees. Building a dict here instead took the LAST one, so the two
@@ -2879,7 +2873,19 @@ class WebSocketAuthMiddleware:
         # drift the shared reader below exists to prevent.
         from starlette.datastructures import Headers
 
-        provided = read_proxy_token(Headers(scope=scope))
+        headers = Headers(scope=scope)
+        client = scope.get("client")
+        client_host = client[0] if client else None
+        # Loopback exemption needs both gates the HTTP admin guards apply: a
+        # loopback peer *and* a loopback ``Host:`` header. The Host check is
+        # the DNS-rebinding defence — a browser on this machine coerced into
+        # opening a socket to 127.0.0.1 still sends ``Host: attacker.com``. A
+        # missing peer address (UDS, adapters) is not loopback (fails closed).
+        if is_loopback_host(client_host) and is_loopback_host_header(headers.get("host")):
+            await self.app(scope, receive, send)
+            return
+
+        provided = read_proxy_token(headers)
         if provided is not None and hmac.compare_digest(
             provided.encode("utf-8", "replace"), self.token_bytes
         ):
@@ -3840,17 +3846,15 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
     # orchestrators can check a container that binds non-loopback.
     _AUTH_EXEMPT_PATHS = frozenset({"/health", "/healthz", "/livez", "/readyz"})
 
-    # Loud warning when a non-loopback bind has no token configured: that is the
-    # exact shape (e.g. the Docker 0.0.0.0 image) that exposes unauthenticated
-    # /v1/* routes to the surrounding network.
-    if not _proxy_token and not is_loopback_host(getattr(config, "host", None)):
-        logger.warning(
-            "event=proxy_open_bind host=%s — proxy is bound to a non-loopback "
-            "interface with no HEADROOM_PROXY_TOKEN set; the /v1/* data-plane "
-            "routes are reachable WITHOUT authentication. Set HEADROOM_PROXY_TOKEN "
-            "to require a bearer token from non-loopback callers.",
-            getattr(config, "host", None),
-        )
+    # A non-loopback bind with no token is the exact shape (``--host 0.0.0.0``
+    # from any launcher) that exposes the unauthenticated /v1/* relay to the
+    # surrounding network. It used to be a warning; it is now refused unless
+    # the operator acknowledges it explicitly (see bind_policy.py). Enforced
+    # here, not only in run_server, so programmatic embeddings and the
+    # multi-worker factory get the same guarantee.
+    from headroom.proxy.bind_policy import enforce_bind_policy
+
+    enforce_bind_policy(getattr(config, "host", None), _proxy_token)
 
     def _apply_security_headers(response) -> None:
         # setdefault: never clobber a header an upstream/handler already set.
@@ -3996,6 +4000,57 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
         """
         if not _request_can_view_dashboard_metadata(request, trusted_dashboard_client_cidrs):
             raise HTTPException(status_code=404)
+
+    def _require_operator_read_client(request: Request) -> None:
+        """Gate the read-only operator routes (dashboard shell, history, quota).
+
+        When an inbound token is configured, any non-loopback request that
+        reaches a handler has already authenticated at the security gate, and
+        a token-holding operator on a public bind is entitled to the dashboard
+        (the docker-bind e2e asserts exactly that: correct token → 200).
+        Without a token these routes fall back to the /settings* trust chain:
+        loopback, or a trusted dashboard client behind a gateway. Settings
+        *writes* deliberately do not get the token short-cut.
+        """
+        if _proxy_token:
+            return
+        _require_loopback_or_trusted_dashboard_client(request)
+
+    def _require_metrics_scrape_client(request: Request) -> None:
+        """Gate ``/metrics`` for scrapers without demanding a dashboard's browser shape.
+
+        ``/metrics`` is a Prometheus target, so unlike the dashboard routes it
+        cannot require an IP-literal ``Host`` header. Allowed callers:
+
+        * any caller when an inbound token is configured — non-loopback
+          requests reaching this handler have already authenticated at the
+          security gate;
+        * loopback (peer *and* Host header, the usual two gates);
+        * a peer inside ``HEADROOM_PROXY_TRUSTED_GATEWAY_CIDRS`` or the
+          dashboard-client CIDRs, provided any browser provenance it carries
+          is same-origin (a scraper sends neither Origin nor Referer).
+
+        Everyone else gets the same 404 the other operator routes return.
+        """
+        if _proxy_token:
+            return
+        if _request_is_loopback(request):
+            return
+        from headroom.proxy.forwarded_headers import (
+            load_trusted_gateway_cidrs,
+            peer_is_trusted_gateway,
+            resolve_client_ip,
+        )
+
+        peer = resolve_client_ip(request)
+        if peer and (
+            peer_is_trusted_gateway(peer, load_trusted_gateway_cidrs())
+            or peer_is_trusted_gateway(peer, trusted_dashboard_client_cidrs)
+        ):
+            host_header = request.headers.get("host")
+            if host_header and _request_has_same_origin_or_no_provenance(request, host_header):
+                return
+        raise HTTPException(status_code=404)
 
     def _require_same_origin_or_trusted_dashboard_client(request: Request) -> None:
         """Same-origin CSRF guard for settings writes, trusted-dashboard aware.
@@ -4176,8 +4231,20 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
         name="dashboard-static",
     )
 
-    @app.get("/dashboard", response_class=HTMLResponse)
-    @app.get("/dashboard/", response_class=HTMLResponse, include_in_schema=False)
+    # The dashboard shell and every read-only telemetry route below carry
+    # operator data (model/project/session labels, spend history, subscription
+    # utilisation, provider quota) and were served to any network caller. They
+    # now answer token-authenticated operators, loopback, or a trusted
+    # dashboard client behind a gateway. Other network callers get 404.
+    _dashboard_gate = [Depends(_require_operator_read_client)]
+
+    @app.get("/dashboard", response_class=HTMLResponse, dependencies=_dashboard_gate)
+    @app.get(
+        "/dashboard/",
+        response_class=HTMLResponse,
+        include_in_schema=False,
+        dependencies=_dashboard_gate,
+    )
     async def dashboard():
         """Serve the Headroom dashboard UI."""
         return get_dashboard_html()
@@ -5107,7 +5174,7 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
             _stats_snapshot["expires_at"] = 0.0
         return JSONResponse(status_code=200, content={"status": "reset"})
 
-    @app.get("/stats-history")
+    @app.get("/stats-history", dependencies=_dashboard_gate)
     async def stats_history(
         format: Literal["json", "csv"] = "json",
         series: Literal["history", "hourly", "daily", "weekly", "monthly"] = "history",
@@ -5184,7 +5251,7 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
 
         return {"transformations": transformations, "log_full_messages": log_full_messages}
 
-    @app.get("/subscription-window")
+    @app.get("/subscription-window", dependencies=_dashboard_gate)
     async def subscription_window():
         """Current Anthropic subscription window utilisation and Headroom contribution.
 
@@ -5209,14 +5276,14 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
         await tracker.maybe_poll_on_demand()
         return JSONResponse(content=tracker.render_state())
 
-    @app.get("/quota")
+    @app.get("/quota", dependencies=_dashboard_gate)
     async def quota():
         """Unified quota/rate-limit stats for all registered providers (Anthropic, Codex, Copilot)."""
         return JSONResponse(content=get_quota_registry().get_all_stats())
 
-    @app.get("/metrics")
+    @app.get("/metrics", dependencies=[Depends(_require_metrics_scrape_client)])
     async def metrics():
-        """Prometheus metrics endpoint."""
+        """Prometheus metrics endpoint (loopback, trusted CIDR, or token-authenticated)."""
         return PlainTextResponse(
             await proxy.metrics.export(),
             media_type="text/plain; version=0.0.4",
@@ -5986,6 +6053,16 @@ def run_server(
     seed_proxy_env_defaults()
 
     config = config or ProxyConfig()
+
+    # Refuse an unacknowledged open bind here, before uvicorn forks, so the
+    # operator gets one error and an exit code instead of N workers crashing
+    # in create_app. create_app enforces the same policy for embedders.
+    from headroom.proxy.bind_policy import evaluate_bind_policy
+
+    _bind = evaluate_bind_policy(config.host, config.proxy_token)
+    if _bind.refused:
+        print(f"ERROR: {_bind.message()}", file=sys.stderr)
+        sys.exit(2)
     if workers < 1:
         raise ValueError("workers must be >= 1")
     config.worker_processes = workers

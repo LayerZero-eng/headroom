@@ -40,7 +40,9 @@ def client(monkeypatch):
             http2=False,
         )
     )
-    with TestClient(app) as c:
+    # The dashboard shell is an operator route: loopback (or a token) since the
+    # network-gate hardening; a default TestClient peer is not loopback.
+    with TestClient(app, base_url="http://127.0.0.1", client=("127.0.0.1", 12345)) as c:
         yield c
 
 

@@ -745,3 +745,145 @@ def test_dashboard_client_cidr_does_not_expand_other_management_endpoints(
     assert client.get("/admin/upstream").status_code == 404
     assert client.get("/debug/tasks").status_code == 404
     assert client.post("/stats/reset").status_code == 404
+
+
+# ─────────────── read-only telemetry routes and the dashboard shell ─────────
+# These carried operator data (model/project/session labels, spend history,
+# subscription utilisation, provider quota, the dashboard UI itself) to any
+# network caller. They now share the /settings* trust chain: loopback or a
+# trusted dashboard client behind a gateway; everyone else sees 404.
+
+DASHBOARD_GATED = [
+    ("get", "/dashboard"),
+    ("get", "/dashboard/"),
+    ("get", "/stats-history"),
+    ("get", "/stats-history?format=csv"),
+    ("get", "/quota"),
+    ("get", "/subscription-window"),
+]
+
+
+@pytest.mark.parametrize("method,path", DASHBOARD_GATED)
+def test_dashboard_routes_non_loopback_gets_404(method: str, path: str) -> None:
+    resp = TestClient(_make_app()).request(method, path)
+    assert resp.status_code == 404, resp.text
+
+
+@pytest.mark.parametrize("method,path", DASHBOARD_GATED)
+def test_dashboard_routes_loopback_caller_allowed(method: str, path: str) -> None:
+    resp = _loopback_client().request(method, path)
+    # /subscription-window answers 503 when tracking is off; the point here is
+    # that the *guard* let the caller through.
+    assert resp.status_code != 404, resp.text
+
+
+@pytest.mark.parametrize("method,path", DASHBOARD_GATED)
+def test_dashboard_routes_trusted_gateway_dashboard_client_allowed(
+    monkeypatch: pytest.MonkeyPatch, method: str, path: str
+) -> None:
+    monkeypatch.setenv("HEADROOM_PROXY_TRUSTED_DASHBOARD_CLIENT_CIDRS", "100.90.0.5/32")
+    client = TestClient(
+        _make_app(),
+        base_url="http://100.82.0.2:8787",
+        client=("100.90.0.5", 12345),
+    )
+    resp = client.request(method, path)
+    assert resp.status_code != 404, resp.text
+
+
+@pytest.mark.parametrize("method,path", DASHBOARD_GATED)
+def test_dashboard_routes_token_authenticated_operator_allowed(
+    monkeypatch: pytest.MonkeyPatch, method: str, path: str
+) -> None:
+    """With a token configured the security gate is the control: 401 without,
+    through with. Mirrors the docker-bind e2e contract (correct token → 200)."""
+    monkeypatch.setenv("HEADROOM_PROXY_TOKEN", "s3cr3t-token")
+    app = _make_app()
+    network = TestClient(app, base_url="http://headroom.svc.internal:8787", client=("10.10.0.7", 1))
+    assert network.request(method, path).status_code == 401
+    wrong = network.request(method, path, headers={"Authorization": "Bearer wrong"})
+    assert wrong.status_code == 401
+    ok = network.request(method, path, headers={"Authorization": "Bearer s3cr3t-token"})
+    assert ok.status_code not in (401, 404), ok.text
+
+
+def test_stats_history_csv_export_not_served_to_network_callers() -> None:
+    """The CSV export is the whole spend/model/session history in one GET."""
+    resp = TestClient(_make_app()).get("/stats-history", params={"format": "csv"})
+    assert resp.status_code == 404
+    assert "text/csv" not in resp.headers.get("content-type", "")
+
+
+# ─────────────────────────────── /metrics ───────────────────────────────────
+# A Prometheus target: it cannot demand the dashboard's IP-literal Host header,
+# but it must not be a free read for every network peer either.
+
+
+def test_metrics_non_loopback_gets_404_without_token_or_cidr() -> None:
+    resp = TestClient(_make_app()).get("/metrics")
+    assert resp.status_code == 404, resp.text
+
+
+def test_metrics_loopback_allowed() -> None:
+    resp = _loopback_client().get("/metrics")
+    assert resp.status_code == 200, resp.text
+    assert "text/plain" in resp.headers["content-type"]
+
+
+def test_metrics_trusted_gateway_cidr_scraper_allowed(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A scraper inside HEADROOM_PROXY_TRUSTED_GATEWAY_CIDRS with a hostname Host."""
+    monkeypatch.setenv("HEADROOM_PROXY_TRUSTED_GATEWAY_CIDRS", "10.9.0.0/24")
+    client = TestClient(
+        _make_app(),
+        base_url="http://headroom.svc.internal:8787",
+        client=("10.9.0.7", 40000),
+    )
+    assert client.get("/metrics").status_code == 200
+
+
+def test_metrics_trusted_dashboard_cidr_allowed(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("HEADROOM_PROXY_TRUSTED_DASHBOARD_CLIENT_CIDRS", "100.90.0.5/32")
+    client = TestClient(
+        _make_app(),
+        base_url="http://100.82.0.2:8787",
+        client=("100.90.0.5", 12345),
+    )
+    assert client.get("/metrics").status_code == 200
+
+
+def test_metrics_trusted_cidr_peer_outside_range_still_404s(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("HEADROOM_PROXY_TRUSTED_GATEWAY_CIDRS", "10.9.0.0/24")
+    client = TestClient(
+        _make_app(),
+        base_url="http://headroom.svc.internal:8787",
+        client=("10.10.0.7", 40000),
+    )
+    assert client.get("/metrics").status_code == 404
+
+
+def test_metrics_trusted_cidr_cross_origin_browser_rejected(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Browser provenance from another origin is refused even from a trusted peer."""
+    monkeypatch.setenv("HEADROOM_PROXY_TRUSTED_GATEWAY_CIDRS", "10.9.0.0/24")
+    client = TestClient(
+        _make_app(),
+        base_url="http://headroom.svc.internal:8787",
+        client=("10.9.0.7", 40000),
+    )
+    resp = client.get("/metrics", headers={"Origin": "http://attacker.example"})
+    assert resp.status_code == 404
+
+
+def test_metrics_token_authenticated_network_caller_allowed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """With a token configured the security gate is the control; /metrics defers to it."""
+    monkeypatch.setenv("HEADROOM_PROXY_TOKEN", "s3cr3t-token")
+    app = _make_app()
+    network = TestClient(app, base_url="http://headroom.svc.internal:8787", client=("10.10.0.7", 1))
+    assert network.get("/metrics").status_code == 401
+    ok = network.get("/metrics", headers={"Authorization": "Bearer s3cr3t-token"})
+    assert ok.status_code == 200, ok.text
