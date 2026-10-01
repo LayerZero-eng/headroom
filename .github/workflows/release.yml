@@ -789,7 +789,13 @@ jobs:
           # recommended pattern for release workflows that may run
           # multiple times against the same version.
           skip-existing: true
-          attestations: false
+          # PEP 740 attestations (Sigstore, via this job's trusted-publishing
+          # OIDC identity; needs only `id-token: write`, already granted above).
+          # They were switched off in #2405 while the Windows wheel and sdist
+          # were failing to publish; no root cause was recorded. On by default
+          # again so every file on PyPI carries provenance. Kill switch without
+          # a code change: set the repository variable PYPI_ATTESTATIONS=false.
+          attestations: ${{ vars.PYPI_ATTESTATIONS != 'false' }}
 
   publish-npm:
     needs: [detect-version, build]
