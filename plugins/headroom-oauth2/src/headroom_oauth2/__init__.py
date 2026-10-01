@@ -8,13 +8,23 @@ from __future__ import annotations
 
 import logging
 import os
+import urllib.parse
 from typing import Any
 
-from .middleware import OAuth2Middleware
+from .middleware import LOCAL_ROUTE_PATHS, LOCAL_ROUTE_PREFIXES, OAuth2Middleware, is_local_route
 from .provider import OAuth2ClientCredentials, OAuth2Error
 
-__all__ = ["OAuth2ClientCredentials", "OAuth2Error", "OAuth2Middleware", "install", "parse_headers"]
-__version__ = "0.1.0"
+__all__ = [
+    "LOCAL_ROUTE_PATHS",
+    "LOCAL_ROUTE_PREFIXES",
+    "OAuth2ClientCredentials",
+    "OAuth2Error",
+    "OAuth2Middleware",
+    "install",
+    "is_local_route",
+    "parse_headers",
+]
+__version__ = "0.1.1"
 log = logging.getLogger("headroom_oauth2")
 
 
@@ -42,6 +52,19 @@ def parse_headers(s: str | None) -> dict[str, str]:
             continue
         out[k] = v
     return out
+
+
+def _redact_url(url: str) -> str:
+    """``scheme://host[:port]`` only -- a tenant token URL can carry a query string or
+    embedded credentials, neither of which belongs in a startup log line."""
+    try:
+        parts = urllib.parse.urlsplit(url)
+        host = parts.hostname or "?"
+        if parts.port:
+            host = f"{host}:{parts.port}"
+        return f"{parts.scheme}://{host}"
+    except ValueError:
+        return "<unparseable>"
 
 
 def _int(env, key):
@@ -134,9 +157,23 @@ def install(app: Any, config: Any) -> None:
             "OpenAI-compatible / passthrough backend (e.g. --backend litellm-openai).",
             backend or "<default>",
         )
-    app.add_middleware(OAuth2Middleware, provider=provider)
+    # The proxy's own inbound credential, read by the same rule the core uses, so
+    # the middleware can recognise an unauthenticated caller on cores that ran
+    # extension middleware outside the gate (see middleware.py).
+    proxy_token = getattr(config, "proxy_token", None) or os.environ.get("HEADROOM_PROXY_TOKEN")
+    local_paths = _split(os.environ.get("HEADROOM_OAUTH2_LOCAL_PATHS"))
+    app.add_middleware(
+        OAuth2Middleware,
+        provider=provider,
+        proxy_token=proxy_token or None,
+        local_path_prefixes=local_paths,
+    )
     log.info(
-        "headroom-oauth2: client-credentials auth installed (token_url=%s, style=%s)",
-        provider.token_url,
+        "headroom-oauth2: client-credentials auth installed (token_url=%s, style=%s, "
+        "scopes=%d, proxy_token=%s, extra_local_paths=%s)",
+        _redact_url(provider.token_url),
         provider.auth_style,
+        len(provider.scopes),
+        "set" if proxy_token else "unset",
+        local_paths or "-",
     )

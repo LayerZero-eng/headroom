@@ -1,5 +1,20 @@
 # Changelog
 
+## 0.1.1
+
+- Inject the upstream bearer only on requests that go upstream. Local routes
+  (`/health`, `/stats*`, `/metrics`, `/v1/compress*`, `/ext/*`, …; see README)
+  are passed through untouched, so an unreachable IdP no longer 502s health
+  probes and management calls no longer mint tokens. `HEADROOM_OAUTH2_LOCAL_PATHS`
+  adds operator-defined prefixes; `/p/<project>/` prefixes are stripped first.
+- Honour `HEADROOM_PROXY_TOKEN`: a remote caller that has not presented the proxy
+  token is left untouched for the core gate to refuse (no mint, no
+  `Authorization` rewrite). Fixes remote clients using the proxy token as their
+  bearer being answered 401 as soon as oauth2 was enabled on cores where
+  extension middleware ran outside the gate.
+- Startup log carries `scheme://host` of the token URL and a scope count instead
+  of the full URL and scope list.
+
 ## 0.1.0
 
 Initial release — generic OAuth2 client-credentials upstream-auth extension for the Headroom proxy.
