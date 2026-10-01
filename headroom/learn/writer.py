@@ -11,6 +11,7 @@ from abc import ABC, abstractmethod
 from datetime import datetime, timezone
 from pathlib import Path
 
+from ..managed_block import block_pattern, sanitize_block_text
 from ._shared import claude_config_dir
 from .models import (
     ProjectInfo,
@@ -18,13 +19,14 @@ from .models import (
     RecommendationTarget,
 )
 
-# Marker delimiters for Headroom-managed sections
+# Marker delimiters for Headroom-managed sections. The pattern spans from the
+# first start marker to the LAST end marker, and everything written between
+# them goes through sanitize_block_text() first, so transcript-derived content
+# can neither close the block early nor hide text from the reader — see
+# headroom.managed_block for the threat this closes.
 _MARKER_START = "<!-- headroom:learn:start -->"
 _MARKER_END = "<!-- headroom:learn:end -->"
-_MARKER_PATTERN = re.compile(
-    re.escape(_MARKER_START) + r".*?" + re.escape(_MARKER_END),
-    re.DOTALL,
-)
+_MARKER_PATTERN = block_pattern(_MARKER_START, _MARKER_END)
 
 
 def _read_text_tolerant(file_path: Path) -> str:
@@ -98,10 +100,14 @@ def _build_section(recommendations: list[Recommendation]) -> str:
     ]
 
     for rec in recommendations:
-        lines.append(f"### {rec.section}")
+        # Section names and bodies come from transcript-derived analysis (tool
+        # output, error text, user messages). Neutralise anything that could
+        # close our markers, hide text, or forge a "### " section heading.
+        section = " ".join(sanitize_block_text(rec.section).split()) or "Learned pattern"
+        lines.append(f"### {section}")
         if rec.estimated_tokens_saved > 0:
             lines.append(f"*~{rec.estimated_tokens_saved:,} tokens/session saved*")
-        lines.append(rec.content)
+        lines.append(sanitize_block_text(rec.content, escape_headings=True))
         lines.append("")
 
     lines.append(_MARKER_END)
