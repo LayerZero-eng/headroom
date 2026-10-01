@@ -1424,11 +1424,13 @@ class HeadroomProxy(
                     "hint=bridge_syncs_only_the_legacy_DB_today_per-project_bridge_follow-up_planned"
                 )
 
-        # Usage Reporter (license validation + phone-home for managed/enterprise).
+        # Usage Reporter (licence validation + phone-home for managed deployments).
+        # Explicit opt-in only: a licence being present must not start outbound
+        # reporting on its own (HEADROOM_USAGE_REPORTING=1 is required).
         # Suppressed entirely in offline mode — the air-gap switch must stop all
-        # egress, including license phone-home, even when a key is configured.
+        # egress, including licence phone-home, even when opted in.
         self.usage_reporter: UsageReporter | None = None
-        if config.license_key and not (config.offline or is_offline()):
+        if config.license_key and config.usage_reporting and not (config.offline or is_offline()):
             from headroom.telemetry.reporter import UsageReporter
 
             self.usage_reporter = UsageReporter(
