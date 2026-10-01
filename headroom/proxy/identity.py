@@ -36,6 +36,26 @@ def set_identity_resolver(resolver: IdentityResolver | None) -> None:
     _resolver = resolver
 
 
+def resolve_authenticated_principal(request: Any) -> str | None:
+    """Return the authenticated principal for ``request``, or ``None``.
+
+    Only a registered custom resolver (see :func:`set_identity_resolver`)
+    establishes a real per-caller identity. The OSS default binds every
+    network caller to the same proxy-token identity and lets loopback callers
+    *choose* a partition by header, so neither is an authenticated principal
+    and both return ``None`` here. Callers that must isolate data between
+    principals (e.g. the response cache) combine this with the caller's own
+    provider credential rather than trusting the default identity.
+    """
+    if _resolver is None:
+        return None
+    try:
+        principal = _resolver(request, default="")
+    except Exception:
+        return None
+    return principal or None
+
+
 def _default_os_user() -> str:
     return os.environ.get("USER", os.environ.get("USERNAME", "default"))
 
